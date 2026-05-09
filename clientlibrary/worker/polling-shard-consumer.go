@@ -32,9 +32,10 @@ package worker
 import (
 	"context"
 	"errors"
-	log "github.com/sirupsen/logrus"
 	"math"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kinesis"
@@ -139,6 +140,9 @@ func (sc *PollingShardConsumer) getRecords() error {
 	sc.bytesRead = 0
 	sc.remBytes = MaxBytes
 
+	// create a per-shard idle sleep strategy instance (stateful strategies like EMA must not be shared)
+	idleSleepStrategy := sc.kclConfig.IdleSleepStrategyFactory()
+
 	// starting async lease renewal thread
 	leaseRenewalErrChan := make(chan error, 1)
 	go func() {
@@ -219,11 +223,16 @@ func (sc *PollingShardConsumer) getRecords() error {
 		}
 		shardIterator = getResp.NextShardIterator
 
-		// Idle between each read, the user is responsible for checkpoint the progress
-		// This value is only used when no records are returned; if records are returned, it should immediately
-		// retrieve the next set of records.
-		if len(getResp.Records) == 0 && aws.ToInt64(getResp.MillisBehindLatest) < int64(sc.kclConfig.IdleTimeBetweenReadsInMillis) {
-			time.Sleep(time.Duration(sc.kclConfig.IdleTimeBetweenReadsInMillis) * time.Millisecond)
+		// When the consumer is caught up (MillisBehindLatest < IdleTimeBetweenReadsInMillis),
+		// delegate sleep duration to the configured IdleSleepStrategy.
+		if aws.ToInt64(getResp.MillisBehindLatest) < int64(sc.kclConfig.IdleTimeBetweenReadsInMillis) {
+			if d := idleSleepStrategy.SleepDuration(
+				len(getResp.Records),
+				sc.kclConfig.MaxRecords,
+				sc.kclConfig.IdleTimeBetweenReadsInMillis,
+			); d > 0 {
+				time.Sleep(d)
+			}
 		}
 
 		select {
@@ -259,15 +268,19 @@ func (sc *PollingShardConsumer) checkCoolOffPeriod() (int, error) {
 		sc.remBytes = MaxBytes
 	}
 	if sc.remBytes < 1 {
-		// Wait until cool down period has passed to prevent ProvisionedThroughputExceededException
-		coolDown := sc.bytesRead / MaxBytesPerSecond
-		if sc.bytesRead%MaxBytesPerSecond > 0 {
+		// totalNeeded accounts for both the next estimated read (bytesRead) and any existing
+		// negative balance (deficit). Using only bytesRead (old behavior) ignored the deficit,
+		// causing remBytes to stay negative across retries and producing an infinite loop when
+		// traffic was saturated.
+		totalNeeded := sc.bytesRead - sc.remBytes
+		coolDown := totalNeeded / MaxBytesPerSecond
+		if totalNeeded%MaxBytesPerSecond > 0 {
 			coolDown++
 		}
 		return coolDown, maxBytesExceededError
-	} else {
-		sc.remBytes -= sc.bytesRead
 	}
+	// Deduction is deferred to callGetRecordsAPI after a successful read so that
+	// TPS-limit retries do not charge the budget a second time for the same read.
 	return 0, nil
 }
 
@@ -299,6 +312,10 @@ func (sc *PollingShardConsumer) callGetRecordsAPI(gri *kinesis.GetRecordsInput) 
 	for _, record := range getResp.Records {
 		sc.bytesRead += len(record.Data)
 	}
+	// Charge the byte budget only after a confirmed successful read. Charging inside
+	// checkCoolOffPeriod (before the call) caused double-deduction on TPS retries because
+	// bytesRead still held the previous read's value when the retry entered checkCoolOffPeriod.
+	sc.remBytes -= sc.bytesRead
 	if sc.lastCheckTime.IsZero() {
 		sc.lastCheckTime = rateLimitTimeNow()
 	}

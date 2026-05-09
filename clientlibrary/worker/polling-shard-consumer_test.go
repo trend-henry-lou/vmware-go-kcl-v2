@@ -353,3 +353,48 @@ func TestPollingShardConsumer_checkCoolOffPeriod(t *testing.T) {
 	// restore original time.Now
 	rateLimitTimeNow = time.Now
 }
+
+// TestCheckCoolOffPeriodDeadLoopRegression verifies the fix for the infinite loop that
+// occurred when traffic saturated both TPS and byte-rate limits simultaneously.
+//
+// Root cause: checkCoolOffPeriod used to deduct sc.bytesRead from remBytes on every call,
+// including TPS-limit retries where no new read had occurred. This caused remBytes to go
+// permanently negative because coolDown was calculated from bytesRead alone and did not
+// account for the existing deficit.
+//
+// Scenario: after 5 reads of 2 MB within 1 second, remBytes ≈ 400 KB and callsLeft = 0.
+// The 6th call hits localTPSExceededError. After the 750 ms sleep, bytesRead still holds
+// the 2 MB from the last successful read. On retry:
+//
+//   OLD: remBytes += 1.5 MB = 1.9 MB  →  remBytes -= bytesRead (2 MB) = -100 KB
+//        coolDown = 2 MB / 2 MB/s = 1 s  →  sleep 1 s
+//        remBytes += 2 MB = 1.9 MB  →  remBytes -= 2 MB = -100 KB  →  repeat forever
+//
+//   NEW: remBytes += 1.5 MB = 1.9 MB  →  no deduction in checkCoolOffPeriod
+//        returns 0, nil; deduction happens only after the next successful API call
+func TestCheckCoolOffPeriodDeadLoopRegression(t *testing.T) {
+	defer func() { rateLimitTimeNow = time.Now }()
+
+	refTime := time.Now()
+
+	// State after a TPS sleep: remBytes went negative because checkCoolOffPeriod charged
+	// bytesRead twice (once before the TPS error, once on retry). Simulate the retry call
+	// with a 1-second-old lastCheckTime and a negative balance.
+	sc := &PollingShardConsumer{
+		lastCheckTime: refTime,
+		remBytes:      -100_000,          // deficit left by old double-deduction
+		bytesRead:     MaxBytesPerSecond, // 2 MB from last successful read
+	}
+	rateLimitTimeNow = func() time.Time {
+		return refTime.Add(1 * time.Second)
+	}
+
+	coolDown, err := sc.checkCoolOffPeriod()
+
+	// After 1 second the 2 MB/s budget replenishes 2 MB: -100 KB + 2 MB = 1.9 MB > 0.
+	assert.Nil(t, err, "budget should have recovered after 1 second")
+	assert.Equal(t, 0, coolDown)
+	// remBytes must stay positive – the old code would have deducted bytesRead again,
+	// leaving remBytes at -100 KB and looping forever.
+	assert.Greater(t, sc.remBytes, 0, "remBytes must be positive after replenishment, not double-deducted")
+}

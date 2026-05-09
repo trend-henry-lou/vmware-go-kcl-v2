@@ -44,6 +44,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 
+	"github.com/vmware/vmware-go-kcl-v2/clientlibrary/interfaces"
 	"github.com/vmware/vmware-go-kcl-v2/clientlibrary/metrics"
 	"github.com/vmware/vmware-go-kcl-v2/logger"
 )
@@ -295,6 +296,11 @@ type (
 
 		// MaxRetryCount The maximum number of retries in case of error
 		MaxRetryCount int
+
+		// IdleSleepStrategyFactory creates a per-shard IdleSleepStrategy instance.
+		// If nil, the original behaviour applies: sleep IdleTimeBetweenReadsInMillis only when 0 records returned.
+		// Use worker.LinearSleepStrategyFactory() or worker.EMASleepStrategyFactory(alpha).
+		IdleSleepStrategyFactory func() interfaces.IdleSleepStrategy
 	}
 )
 
