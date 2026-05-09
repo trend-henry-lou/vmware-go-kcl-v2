@@ -42,7 +42,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 
+	"github.com/vmware/vmware-go-kcl-v2/clientlibrary/interfaces"
 	"github.com/vmware/vmware-go-kcl-v2/clientlibrary/metrics"
+	"github.com/vmware/vmware-go-kcl-v2/clientlibrary/sleepstrategy"
 	"github.com/vmware/vmware-go-kcl-v2/clientlibrary/utils"
 	"github.com/vmware/vmware-go-kcl-v2/logger"
 )
@@ -105,6 +107,7 @@ func NewKinesisClientLibConfigWithCredentials(applicationName, streamName, regio
 		LeaseRefreshWaitTime:                             DefaultLeaseRefreshWaitTime,
 		MaxRetryCount:                                    DefaultMaxRetryCount,
 		Logger:                                           logger.GetDefaultLogger(),
+		IdleSleepStrategyFactory:                         sleepstrategy.DefaultIdleSleepStrategyFactory,
 	}
 }
 
@@ -165,6 +168,13 @@ func (c *KinesisClientLibConfiguration) WithShardSyncIntervalMillis(shardSyncInt
 func (c *KinesisClientLibConfiguration) WithMaxRecords(maxRecords int) *KinesisClientLibConfiguration {
 	checkIsValuePositive("MaxRecords", maxRecords)
 	c.MaxRecords = maxRecords
+	return c
+}
+
+// WithIdleSleepStrategyFactory sets a factory that creates a per-shard IdleSleepStrategy.
+// The factory is called once per shard consumer at startup so each shard gets its own instance.
+func (c *KinesisClientLibConfiguration) WithIdleSleepStrategyFactory(factory func() interfaces.IdleSleepStrategy) *KinesisClientLibConfiguration {
+	c.IdleSleepStrategyFactory = factory
 	return c
 }
 
